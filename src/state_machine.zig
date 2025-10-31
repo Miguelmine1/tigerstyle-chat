@@ -55,7 +55,7 @@ pub const RoomState = struct {
     pub fn init(allocator: std.mem.Allocator, room_id: u128) !RoomState {
         return RoomState{
             .room_id = room_id,
-            .messages = std.ArrayList(Message).init(allocator),
+            .messages = .{},
             .message_index = std.AutoHashMap(u128, usize).init(allocator),
             .idempotency_table = std.AutoHashMap(IdempotencyKey, u64).init(allocator),
             .last_op = 0,
@@ -68,7 +68,7 @@ pub const RoomState = struct {
 
     /// Clean up resources.
     pub fn deinit(self: *RoomState) void {
-        self.messages.deinit();
+        self.messages.deinit(self.allocator);
         self.message_index.deinit();
         self.idempotency_table.deinit();
     }
@@ -112,7 +112,7 @@ pub const RoomState = struct {
 
         // Apply message: add to state
         const index = self.messages.items.len;
-        try self.messages.append(msg);
+        try self.messages.append(self.allocator, msg);
         try self.message_index.put(msg.msg_id, index);
         try self.idempotency_table.put(idem_key, op);
 
