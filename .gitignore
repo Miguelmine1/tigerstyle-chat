@@ -1,0 +1,68 @@
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# Build outputs
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Test artifacts
+/test-results/
+/coverage/
+/findings/
+/corpus/
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE and editor files
+.vscode/
+.idea/
+*.iml
+*.sublime-*
+.fleet/
+*.code-workspace
+
+# Simulation outputs
+/sim-traces/
+/sim-logs/
+
+# Integration test data
+/tmp/
+/test-data/
+
+# Profiling and debugging
+*.prof
+*.trace
+callgrind.out.*
+massif.out.*
+perf.data*
+vgcore.*
+
+# Fuzzing
+/afl-out/
+/libfuzzer-out/
+
+# Documentation build
+/docs-out/
+
+# Local config
+*.local.toml
+.env
+.env.local
+
+# Core dumps
+core
+core.*
+
+# Logs
+*.log
