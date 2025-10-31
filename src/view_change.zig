@@ -285,6 +285,44 @@ pub const ElectionCoordinator = struct {
     }
 };
 
+/// View installation handler for completing view change.
+pub const ViewInstaller = struct {
+    replica: *Replica,
+
+    pub fn init(replica: *Replica) ViewInstaller {
+        return ViewInstaller{
+            .replica = replica,
+        };
+    }
+
+    /// Handle start_view message from new primary.
+    /// Installs new view and returns to normal operation.
+    pub fn handleStartView(
+        self: *ViewInstaller,
+        view: u32,
+        log_state: LogState,
+    ) !void {
+        // Verify we're in view change state
+        if (self.replica.state != .view_change) {
+            return error.NotInViewChangeState;
+        }
+
+        // Verify view matches or is newer
+        if (view < self.replica.view) {
+            return error.OldView;
+        }
+
+        // Install new view state
+        // In production, would replay log entries if needed
+        // For now, update state to match new primary
+        self.replica.wal.last_op = log_state.last_op;
+        self.replica.commit_num = log_state.commit_num;
+
+        // Complete view change - return to normal operation
+        self.replica.completeViewChange(view);
+    }
+};
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -526,4 +564,167 @@ test "ElectionCoordinator: deterministic primary selection" {
     // View 3: primary = 3 % 3 = 0 (wraps around)
     const p3: u8 = @intCast(3 % 3);
     try std.testing.expectEqual(@as(u8, 0), p3);
+}
+
+test "ViewInstaller: install new view" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_view_installer.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = replica_mod.ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 2, // Backup replica
+        .peers = [_]replica_mod.Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 1 },
+        },
+    };
+
+    var rep = try Replica.init(allocator, config, test_wal);
+    defer rep.deinit();
+
+    // Start view change
+    rep.startViewChange(1);
+    try std.testing.expectEqual(replica_mod.ReplicaState.view_change, rep.state);
+
+    var installer = ViewInstaller.init(&rep);
+
+    // Receive start_view from new primary
+    try installer.handleStartView(1, LogState.init(10, 8));
+
+    // Verify view installed
+    try std.testing.expectEqual(replica_mod.ReplicaState.normal, rep.state);
+    try std.testing.expectEqual(@as(u32, 1), rep.view);
+    try std.testing.expectEqual(@as(u64, 10), rep.wal.last_op);
+    try std.testing.expectEqual(@as(u64, 8), rep.commit_num);
+}
+
+test "ViewInstaller: reject old view" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_view_installer_old.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = replica_mod.ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 2,
+        .peers = [_]replica_mod.Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 1 },
+        },
+    };
+
+    var rep = try Replica.init(allocator, config, test_wal);
+    defer rep.deinit();
+
+    // Already in view 2
+    rep.startViewChange(2);
+
+    var installer = ViewInstaller.init(&rep);
+
+    // Try to install view 1 (older) - should reject
+    try std.testing.expectError(error.OldView, installer.handleStartView(1, LogState.init(10, 8)));
+}
+
+test "ViewChange: full protocol simulation" {
+    const allocator = std.testing.allocator;
+
+    // Create 3 replicas
+    const configs = [3]replica_mod.ReplicaConfig{
+        .{
+            .cluster_id = 1,
+            .replica_id = 0,
+            .peers = [_]replica_mod.Peer{
+                .{ .replica_id = 1 },
+                .{ .replica_id = 2 },
+            },
+        },
+        .{
+            .cluster_id = 1,
+            .replica_id = 1,
+            .peers = [_]replica_mod.Peer{
+                .{ .replica_id = 0 },
+                .{ .replica_id = 2 },
+            },
+        },
+        .{
+            .cluster_id = 1,
+            .replica_id = 2,
+            .peers = [_]replica_mod.Peer{
+                .{ .replica_id = 0 },
+                .{ .replica_id = 1 },
+            },
+        },
+    };
+
+    const test_wals = [3][]const u8{
+        "test_vc_sim_r0.wal",
+        "test_vc_sim_r1.wal",
+        "test_vc_sim_r2.wal",
+    };
+    defer for (test_wals) |wal| {
+        std.fs.cwd().deleteFile(wal) catch {};
+    };
+
+    var replicas: [3]Replica = undefined;
+    for (&replicas, 0..) |*rep, i| {
+        rep.* = try Replica.init(allocator, configs[i], test_wals[i]);
+    }
+    defer for (&replicas) |*rep| {
+        rep.deinit();
+    };
+
+    // SCENARIO: Primary (replica 0) fails, view change to view 1
+    // New primary will be replica 1 (1 % 3 = 1)
+
+    // Step 1: Replicas 1 and 2 detect timeout
+    var vc1 = ViewChangeState.init(&replicas[1]);
+    var vc2 = ViewChangeState.init(&replicas[2]);
+
+    vc1.timeout_tracker.recordPrepare(1000);
+    vc2.timeout_tracker.recordPrepare(1000);
+
+    // Timeout triggers view change
+    const triggered1 = try vc1.checkTimeout(52000);
+    const triggered2 = try vc2.checkTimeout(52000);
+    try std.testing.expect(triggered1);
+    try std.testing.expect(triggered2);
+
+    // Both now in view 1
+    try std.testing.expectEqual(@as(u32, 1), replicas[1].view);
+    try std.testing.expectEqual(@as(u32, 1), replicas[2].view);
+
+    // Step 2: Replicas send do_view_change to new primary (replica 1)
+    var coordinator = ElectionCoordinator.init(&replicas[1]);
+
+    // Replica 1 (new primary) has own log
+    const ready1 = try coordinator.handleDoViewChange(1, 1, LogState.init(5, 3));
+    try std.testing.expect(!ready1); // Only self, need quorum
+
+    // Replica 2 sends do_view_change
+    const ready2 = try coordinator.handleDoViewChange(1, 2, LogState.init(7, 5));
+    try std.testing.expect(ready2); // Quorum reached!
+
+    // Step 3: New primary (replica 1) has merged log (highest op = 7)
+    try std.testing.expectEqual(@as(u64, 7), replicas[1].wal.last_op);
+    try std.testing.expectEqual(@as(u64, 5), replicas[1].commit_num);
+
+    // Step 4: New primary completes view change and broadcasts start_view
+    replicas[1].completeViewChange(1);
+    const merged_log = LogState.init(replicas[1].wal.last_op, replicas[1].commit_num);
+
+    // Replica 2 installs new view
+    var installer2 = ViewInstaller.init(&replicas[2]);
+    try installer2.handleStartView(1, merged_log);
+
+    // Step 5: Verify replicas back in normal state
+    try std.testing.expectEqual(replica_mod.ReplicaState.normal, replicas[1].state);
+    try std.testing.expectEqual(replica_mod.ReplicaState.normal, replicas[2].state);
+
+    // Step 6: Verify all have same view and log state
+    try std.testing.expectEqual(@as(u32, 1), replicas[1].view);
+    try std.testing.expectEqual(@as(u32, 1), replicas[2].view);
+    try std.testing.expectEqual(@as(u64, 7), replicas[2].wal.last_op);
+    try std.testing.expectEqual(@as(u64, 5), replicas[2].commit_num);
+
+    // VIEW CHANGE COMPLETE!
 }
