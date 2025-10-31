@@ -155,7 +155,7 @@ pub const Replica = struct {
     }
 
     /// Get or create room state.
-    fn getOrCreateRoom(self: *Replica, room_id: u128) !*RoomState {
+    pub fn getOrCreateRoom(self: *Replica, room_id: u128) !*RoomState {
         const entry = try self.rooms.getOrPut(room_id);
         if (!entry.found_existing) {
             entry.value_ptr.* = try RoomState.init(self.allocator, room_id);
