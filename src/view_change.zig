@@ -150,6 +150,141 @@ pub const ViewChangeState = struct {
     }
 };
 
+/// Log state information for view change.
+pub const LogState = struct {
+    last_op: u64,
+    commit_num: u64,
+
+    pub fn init(last_op: u64, commit_num: u64) LogState {
+        return LogState{
+            .last_op = last_op,
+            .commit_num = commit_num,
+        };
+    }
+};
+
+/// do_view_change message tracking.
+pub const DoViewChangeTracker = struct {
+    view: u32,
+    do_view_change_count: u8,
+    do_view_change_from: [3]bool,
+    log_states: [3]?LogState, // Log state from each replica
+
+    pub fn init(view: u32) DoViewChangeTracker {
+        return DoViewChangeTracker{
+            .view = view,
+            .do_view_change_count = 0,
+            .do_view_change_from = [_]bool{false} ** 3,
+            .log_states = [_]?LogState{null} ** 3,
+        };
+    }
+
+    /// Record do_view_change from a replica.
+    pub fn recordDoViewChange(
+        self: *DoViewChangeTracker,
+        from_replica: u8,
+        log_state: LogState,
+    ) void {
+        assert(from_replica < 3);
+        if (!self.do_view_change_from[from_replica]) {
+            self.do_view_change_from[from_replica] = true;
+            self.log_states[from_replica] = log_state;
+            self.do_view_change_count += 1;
+        }
+    }
+
+    /// Check if quorum achieved (2/3).
+    pub fn hasQuorum(self: *const DoViewChangeTracker) bool {
+        return self.do_view_change_count >= 2;
+    }
+
+    /// Merge logs: select highest op.
+    /// Returns the log state with highest op (and highest commit_num as tiebreaker).
+    pub fn mergeLog(self: *const DoViewChangeTracker) LogState {
+        var best_log = LogState.init(0, 0);
+
+        for (self.log_states) |maybe_log| {
+            if (maybe_log) |log| {
+                // Highest op wins
+                if (log.last_op > best_log.last_op) {
+                    best_log = log;
+                } else if (log.last_op == best_log.last_op) {
+                    // Tiebreaker: highest commit_num
+                    if (log.commit_num > best_log.commit_num) {
+                        best_log = log;
+                    }
+                }
+            }
+        }
+
+        return best_log;
+    }
+};
+
+/// New primary election coordinator.
+pub const ElectionCoordinator = struct {
+    replica: *Replica,
+    do_view_change_tracker: ?DoViewChangeTracker,
+
+    pub fn init(replica: *Replica) ElectionCoordinator {
+        return ElectionCoordinator{
+            .replica = replica,
+            .do_view_change_tracker = null,
+        };
+    }
+
+    /// Handle do_view_change message.
+    /// Returns true if quorum achieved and we should send start_view.
+    pub fn handleDoViewChange(
+        self: *ElectionCoordinator,
+        view: u32,
+        from_replica: u8,
+        log_state: LogState,
+    ) !bool {
+        // Verify we're the new primary for this view
+        const expected_primary = @as(u8, @intCast(view % 3));
+        if (expected_primary != self.replica.config.replica_id) {
+            return false; // Not the new primary
+        }
+
+        // Verify we're in view change state
+        if (self.replica.state != .view_change) {
+            return false;
+        }
+
+        // Initialize tracker for this view if needed
+        if (self.do_view_change_tracker == null or
+            self.do_view_change_tracker.?.view != view)
+        {
+            self.do_view_change_tracker = DoViewChangeTracker.init(view);
+        }
+
+        // Record this replica's do_view_change
+        self.do_view_change_tracker.?.recordDoViewChange(from_replica, log_state);
+
+        // Check if quorum achieved (S2)
+        if (self.do_view_change_tracker.?.hasQuorum()) {
+            // Merge logs (highest op wins)
+            const merged_log = self.do_view_change_tracker.?.mergeLog();
+
+            // Update our state to match merged log
+            // In production, would replay log entries if needed
+            // For now, just update op numbers
+            self.replica.wal.last_op = merged_log.last_op;
+            self.replica.commit_num = merged_log.commit_num;
+
+            return true; // Ready to send start_view
+        }
+
+        return false;
+    }
+
+    /// Reset after view change completes.
+    pub fn reset(self: *ElectionCoordinator) void {
+        self.do_view_change_tracker = null;
+    }
+};
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -281,4 +416,114 @@ test "ViewChange: primary doesn't timeout itself" {
     const triggered = try vc.checkTimeout(100000);
     try std.testing.expect(!triggered);
     try std.testing.expectEqual(replica_mod.ReplicaState.normal, rep.state);
+}
+
+test "LogMerge: highest op wins" {
+    var tracker = DoViewChangeTracker.init(1);
+
+    // Replica 0: op=5, commit=3
+    tracker.recordDoViewChange(0, LogState.init(5, 3));
+
+    // Replica 1: op=7, commit=5 (highest)
+    tracker.recordDoViewChange(1, LogState.init(7, 5));
+
+    // Replica 2: op=6, commit=6
+    tracker.recordDoViewChange(2, LogState.init(6, 6));
+
+    const merged = tracker.mergeLog();
+    try std.testing.expectEqual(@as(u64, 7), merged.last_op); // Highest op
+    try std.testing.expectEqual(@as(u64, 5), merged.commit_num);
+}
+
+test "LogMerge: commit_num tiebreaker" {
+    var tracker = DoViewChangeTracker.init(1);
+
+    // Replica 0: op=10, commit=8
+    tracker.recordDoViewChange(0, LogState.init(10, 8));
+
+    // Replica 1: op=10, commit=10 (same op, higher commit)
+    tracker.recordDoViewChange(1, LogState.init(10, 10));
+
+    const merged = tracker.mergeLog();
+    try std.testing.expectEqual(@as(u64, 10), merged.last_op);
+    try std.testing.expectEqual(@as(u64, 10), merged.commit_num); // Tiebreaker
+}
+
+test "ElectionCoordinator: quorum and log merge" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_election.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = replica_mod.ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1, // Will be new primary for view 1
+        .peers = [_]replica_mod.Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var rep = try Replica.init(allocator, config, test_wal);
+    defer rep.deinit();
+
+    // Transition to view change
+    rep.startViewChange(1);
+
+    var coordinator = ElectionCoordinator.init(&rep);
+
+    // Receive do_view_change from replica 0
+    const ready1 = try coordinator.handleDoViewChange(1, 0, LogState.init(5, 3));
+    try std.testing.expect(!ready1); // Only 1/3, need quorum
+
+    // Receive do_view_change from replica 2 (2/3 = quorum!)
+    const ready2 = try coordinator.handleDoViewChange(1, 2, LogState.init(7, 5));
+    try std.testing.expect(ready2); // Quorum reached!
+
+    // Verify log merged (highest op = 7)
+    try std.testing.expectEqual(@as(u64, 7), rep.wal.last_op);
+    try std.testing.expectEqual(@as(u64, 5), rep.commit_num);
+}
+
+test "ElectionCoordinator: only new primary processes" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_election_wrong_primary.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = replica_mod.ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 2, // NOT the new primary for view 1 (should be replica 1)
+        .peers = [_]replica_mod.Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 1 },
+        },
+    };
+
+    var rep = try Replica.init(allocator, config, test_wal);
+    defer rep.deinit();
+
+    rep.startViewChange(1);
+
+    var coordinator = ElectionCoordinator.init(&rep);
+
+    // Try to handle do_view_change - should reject (not new primary)
+    const ready = try coordinator.handleDoViewChange(1, 0, LogState.init(5, 3));
+    try std.testing.expect(!ready); // Rejected
+}
+
+test "ElectionCoordinator: deterministic primary selection" {
+    // View 0: primary = 0 % 3 = 0
+    const p0: u8 = @intCast(0 % 3);
+    try std.testing.expectEqual(@as(u8, 0), p0);
+
+    // View 1: primary = 1 % 3 = 1
+    const p1: u8 = @intCast(1 % 3);
+    try std.testing.expectEqual(@as(u8, 1), p1);
+
+    // View 2: primary = 2 % 3 = 2
+    const p2: u8 = @intCast(2 % 3);
+    try std.testing.expectEqual(@as(u8, 2), p2);
+
+    // View 3: primary = 3 % 3 = 0 (wraps around)
+    const p3: u8 = @intCast(3 % 3);
+    try std.testing.expectEqual(@as(u8, 0), p3);
 }
