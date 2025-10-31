@@ -187,6 +187,65 @@ pub const Replica = struct {
     pub fn isPrimary(self: *const Replica) bool {
         return self.getPrimaryId() == self.config.replica_id;
     }
+
+    /// Handle prepare message from primary.
+    /// Appends to WAL and returns true if should send prepare_ok.
+    pub fn handlePrepare(self: *Replica, view: u32, op: u64, msg: *const Message) !bool {
+        // Verify we're in normal state
+        if (self.state != .normal) {
+            return error.NotInNormalState;
+        }
+
+        // Verify view matches current view
+        if (view != self.view) {
+            return error.ViewMismatch;
+        }
+
+        // Verify message from primary
+        // In production, would verify via transport header sender_id
+        // For now, trust the view number (expected_primary = self.getPrimaryId())
+
+        // S1: Verify op is next in sequence
+        if (op != self.wal.last_op + 1) {
+            return error.NonSequentialOp;
+        }
+
+        // Append to WAL (durability)
+        try self.wal.append(op, msg);
+
+        // Apply to local state machine (optimistic)
+        const room = try self.getOrCreateRoom(msg.room_id);
+        _ = try room.apply(op, msg.*);
+
+        // Should send prepare_ok to primary
+        return true;
+    }
+
+    /// Handle commit message from primary.
+    /// Updates commit_num (S3: sequential commits).
+    pub fn handleCommit(self: *Replica, view: u32, commit_num: u64) !void {
+        // Verify we're in normal state
+        if (self.state != .normal) {
+            return error.NotInNormalState;
+        }
+
+        // Verify view matches
+        if (view != self.view) {
+            return error.ViewMismatch;
+        }
+
+        // S3: Commits must be sequential
+        // Can commit up to commit_num, but must be consecutive
+        if (commit_num < self.commit_num) {
+            return error.CommitNumTooLow;
+        }
+
+        // In production, would verify:
+        // 1. All ops up to commit_num are in WAL
+        // 2. All ops up to commit_num are applied to state machine
+        // For now, update commit_num
+        self.commit_num = commit_num;
+    }
 };
 
 // ============================================================================
@@ -385,4 +444,226 @@ test "Replica: config validation" {
         },
     };
     try std.testing.expectError(error.InvalidReplicaId, Replica.init(allocator, bad_id, test_wal));
+}
+
+test "Replica: handle prepare" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_replica_prepare.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1, // Backup replica
+        .peers = [_]Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var replica = try Replica.init(allocator, config, test_wal);
+    defer replica.deinit();
+
+    var msg = Message{
+        .room_id = 1,
+        .msg_id = 100,
+        .author_id = 1,
+        .parent_id = 0,
+        .timestamp = 1000,
+        .sequence = 1,
+        .body_len = 4,
+        .flags = 0,
+        .body = undefined,
+        .prev_hash = [_]u8{0} ** 32,
+        .checksum = 0,
+        .reserved = [_]u8{0} ** 196,
+    };
+    @memset(&msg.body, 0);
+    @memcpy(msg.body[0..4], "test");
+    msg.zeroPadding();
+    msg.updateChecksum();
+
+    // Handle prepare from primary (view 0)
+    const should_send_ok = try replica.handlePrepare(0, 1, &msg);
+    try std.testing.expect(should_send_ok);
+
+    // Verify WAL updated
+    try std.testing.expectEqual(@as(u64, 1), replica.wal.last_op);
+
+    // Verify state machine updated
+    const room = replica.rooms.get(1).?;
+    try std.testing.expectEqual(@as(u64, 1), room.last_op);
+}
+
+test "Replica: handle commit" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_replica_commit.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1,
+        .peers = [_]Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var replica = try Replica.init(allocator, config, test_wal);
+    defer replica.deinit();
+
+    // Initially commit_num = 0
+    try std.testing.expectEqual(@as(u64, 0), replica.commit_num);
+
+    // Handle commit from primary
+    try replica.handleCommit(0, 1);
+    try std.testing.expectEqual(@as(u64, 1), replica.commit_num);
+
+    // Handle another commit
+    try replica.handleCommit(0, 2);
+    try std.testing.expectEqual(@as(u64, 2), replica.commit_num);
+}
+
+test "Replica: view mismatch errors" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_replica_view_error.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1,
+        .peers = [_]Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var replica = try Replica.init(allocator, config, test_wal);
+    defer replica.deinit();
+
+    var msg = Message{
+        .room_id = 1,
+        .msg_id = 100,
+        .author_id = 1,
+        .parent_id = 0,
+        .timestamp = 1000,
+        .sequence = 1,
+        .body_len = 4,
+        .flags = 0,
+        .body = undefined,
+        .prev_hash = [_]u8{0} ** 32,
+        .checksum = 0,
+        .reserved = [_]u8{0} ** 196,
+    };
+    @memset(&msg.body, 0);
+    @memcpy(msg.body[0..4], "test");
+    msg.zeroPadding();
+    msg.updateChecksum();
+
+    // Replica is in view 0, message claims view 1
+    try std.testing.expectError(error.ViewMismatch, replica.handlePrepare(1, 1, &msg));
+    try std.testing.expectError(error.ViewMismatch, replica.handleCommit(1, 1));
+}
+
+test "Replica: sequential op enforcement" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_replica_sequential.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1,
+        .peers = [_]Peer{
+            .{ .replica_id = 0 },
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var replica = try Replica.init(allocator, config, test_wal);
+    defer replica.deinit();
+
+    var msg = Message{
+        .room_id = 1,
+        .msg_id = 100,
+        .author_id = 1,
+        .parent_id = 0,
+        .timestamp = 1000,
+        .sequence = 1,
+        .body_len = 4,
+        .flags = 0,
+        .body = undefined,
+        .prev_hash = [_]u8{0} ** 32,
+        .checksum = 0,
+        .reserved = [_]u8{0} ** 196,
+    };
+    @memset(&msg.body, 0);
+    @memcpy(msg.body[0..4], "test");
+    msg.zeroPadding();
+    msg.updateChecksum();
+
+    // Try to prepare op 2 (skipping op 1) - should fail
+    try std.testing.expectError(error.NonSequentialOp, replica.handlePrepare(0, 2, &msg));
+
+    // Prepare op 1 - should succeed
+    _ = try replica.handlePrepare(0, 1, &msg);
+    try std.testing.expectEqual(@as(u64, 1), replica.wal.last_op);
+}
+
+test "Replica: end-to-end commit simulation" {
+    const allocator = std.testing.allocator;
+    const test_wal = "test_replica_e2e.wal";
+    defer std.fs.cwd().deleteFile(test_wal) catch {};
+
+    const config = ReplicaConfig{
+        .cluster_id = 1,
+        .replica_id = 1, // Backup replica
+        .peers = [_]Peer{
+            .{ .replica_id = 0 }, // Primary
+            .{ .replica_id = 2 },
+        },
+    };
+
+    var replica = try Replica.init(allocator, config, test_wal);
+    defer replica.deinit();
+
+    // Simulate 3 messages being committed
+    var messages: [3]Message = undefined;
+    for (&messages, 0..) |*msg, i| {
+        msg.* = Message{
+            .room_id = 1,
+            .msg_id = 100 + @as(u128, i),
+            .author_id = 1,
+            .parent_id = 0,
+            .timestamp = 1000 + @as(u64, i) * 100,
+            .sequence = @as(u64, i) + 1,
+            .body_len = 4,
+            .flags = 0,
+            .body = undefined,
+            .prev_hash = [_]u8{0} ** 32,
+            .checksum = 0,
+            .reserved = [_]u8{0} ** 196,
+        };
+        @memset(&msg.body, 0);
+        @memcpy(msg.body[0..4], "test");
+        msg.zeroPadding();
+        msg.updateChecksum();
+    }
+
+    // Primary sends prepare for each message
+    for (&messages, 0..) |*msg, i| {
+        const op = @as(u64, i) + 1;
+        const should_send_ok = try replica.handlePrepare(0, op, msg);
+        try std.testing.expect(should_send_ok);
+    }
+
+    // Verify all in WAL
+    try std.testing.expectEqual(@as(u64, 3), replica.wal.last_op);
+
+    // Verify all in state machine
+    const room = replica.rooms.get(1).?;
+    try std.testing.expectEqual(@as(u64, 3), room.last_op);
+    try std.testing.expectEqual(@as(usize, 3), room.message_count);
+
+    // Primary sends commit after quorum
+    try replica.handleCommit(0, 3);
+    try std.testing.expectEqual(@as(u64, 3), replica.commit_num);
 }
